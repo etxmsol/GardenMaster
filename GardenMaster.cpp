@@ -8,6 +8,8 @@
 #define MY_DEBUG
 #define MY_NODE_ID 2
 
+//#define FREE_RAM_DEBUG
+
 #define SKETCH_NAME "GardenMaster"
 #define SKETCH_MAJOR_VER "2"
 #define SKETCH_MINOR_VER "0"
@@ -25,23 +27,31 @@
 
 #include <MySensors.h>
 
-MyMessage msgMoist(MOISTURE_CHILD_ID, V_HUM);
-MyMessage msgTemp(TEMP_CHILD_ID, V_TEMP);
+static MyMessage msgMoist(MOISTURE_CHILD_ID, V_HUM);
+static MyMessage msgTemp(TEMP_CHILD_ID, V_TEMP);
 
-static const char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+const char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 
 
 const uint16_t SHT10_DATA = 6;				// moisture input (digital)
 const uint16_t SHT10_CLK = 7;				//
-const uint16_t THRESHOLD_DRYNESS = 50;
 
-SHT1x sht1x(SHT10_DATA, SHT10_CLK);
+// the dryness_threshold will be populated from the config.txt file on SD-card
+// if the dryness_threshold is not properly configured, the alarm
+// pin goes off and the event is logged down to SD log if possible
+
+static uint16_t dryness_threshold = 0;
+const uint16_t DRYNESS_LOWEST = 50;
+const uint16_t DRYNESS_HIGHEST = 95;
+const uint16_t TEMP_LOWEST = 10;
+
+static SHT1x sht1x(SHT10_DATA, SHT10_CLK);
 
 
 const uint16_t MAGNET_VALVE_PIN = 8;		// valve control output
-static const uint8_t ALARM_LED_PIN = 4;
+const uint8_t ALARM_LED_PIN = 4;
 
-RTC_DS1307 rtc;
+static RTC_DS1307 rtc;
 
 // change this to match your SD shield or module;
 // Arduino Ethernet shield: pin 4
@@ -49,11 +59,73 @@ RTC_DS1307 rtc;
 // Sparkfun SD shield: pin 8
 const int chipSelect = 10;
 
+
+const uint16_t dailyWaterLimit = 15;
+static uint16_t consumedToday = 0;
+
+const char fileName[] = "water.txt";
+static char configFileName[] = "config.txt";
+
+static int today = 0;
+
+
+
 int freeRam () {
   extern int __heap_start, *__brkval;
   int v;
   return (int) &v - (__brkval == 0 ? (int) &__heap_start : (int) __brkval);
 }
+
+bool isValidDrynessThreshold(uint16_t dryness_threshold)
+{
+	return dryness_threshold >= DRYNESS_LOWEST && dryness_threshold <= DRYNESS_HIGHEST;
+}
+
+void log(const char * buf)
+{
+#ifdef FREE_RAM_DEBUG
+	Serial1.print("before logging: ");
+	Serial1.println(freeRam());
+#endif
+
+	Serial1.print( "opening file " );
+	Serial1.print( fileName );
+	Serial1.print( " for logging ... " );
+	File f = SD.open( fileName, FILE_WRITE);
+
+#ifdef FREE_RAM_DEBUG
+	Serial1.print("after open: ");
+	Serial1.println(freeRam());
+#endif
+
+	if (f)
+	{
+		Serial1.println( "SUCCESS" );
+
+		if( !f.println(buf) )
+		{
+			digitalWrite( ALARM_LED_PIN, HIGH );
+
+			Serial1.println( "Failed to log. Is the SD inserted? Do not forget to reset after insertion" );
+		}
+
+#ifdef FREE_RAM_DEBUG
+		Serial1.print("after output: ");
+		Serial1.println(freeRam());
+#endif
+		f.close();
+	} else {
+		Serial1.println( "FAILED" );
+
+	// if the file didn't open, print an error:
+		digitalWrite( ALARM_LED_PIN, HIGH );
+
+		const char errMsg[] = "ERROR: error opening file for writing";
+		Serial1.println(errMsg);
+		log(errMsg);
+	}
+}
+
 
 void setup()
 {
@@ -121,65 +193,109 @@ void setup()
 
 	if ( !SD.begin(chipSelect, 11, 12, 13) )
 	{
-		Serial1.println("SD card not found");
+		// this error condition apparently cannot be logged to the SD-card
+		Serial1.println("ERROR: SD card not found");
 		digitalWrite( ALARM_LED_PIN, HIGH );
 
 	}
 	else
 	{
 		Serial1.println("SD card OK");
-	}
 
-	Serial1.print("at setup: ");
-	Serial1.println(freeRam());
-}
+		// obtain dryness_threshold
 
-const uint16_t dailyWaterLimit = 25;
-uint16_t consumedToday = 0;
+		// open the file. note that only one file can be open at a time,
+		// so you have to close this one before opening another.
 
-const char fileName[] = "water.txt";
+		// check if the file exists.
 
-int today = 0;
+		bool cfgFileExists = SD.exists(configFileName);
 
-bool log(const char * buf)
-{
-	Serial1.print("before logging: ");
-	Serial1.println(freeRam());
-
-	Serial1.print( "opening file " );
-	Serial1.println( fileName );
-	File f = SD.open( fileName, FILE_WRITE);
-
-	Serial1.print("after open: ");
-	Serial1.println(freeRam());
-
-	if (f)
-	{
-		if( !f.println(buf) )
+		if( cfgFileExists )
 		{
+			Serial1.println( "config.txt found" );
+
+			File cfgFile = SD.open(configFileName);
+
+			if ( cfgFile && cfgFile.available() )
+			{
+				Serial1.println("config.txt:");
+
+				char buf[128];
+				char * bufPtr = buf;
+
+				// read from the file until there's nothing else in it:
+				do
+				{
+					int c = cfgFile.read();
+
+					if(c == '\r')
+						continue;
+
+					if(c == '\n' || !cfgFile.available() /*EOF*/)
+					{
+						if( !cfgFile.available() )
+						{
+							Serial1.println( "EOF" );
+							*bufPtr++ = c;
+						}
+
+						*bufPtr = 0;
+						bufPtr = buf;
+
+					    Serial1.println( buf );
+
+					    // now parsing. Currently, it is only one value on the very first line
+					    // the dryness_threshold in %, the range 50 to 95 allowed.
+
+					    dryness_threshold = atoi(buf);
+
+					    if(!isValidDrynessThreshold(dryness_threshold))
+					    {
+					    	const char errMsg[] = "ERROR: invalid value for dryness_threshold (allowed 50-95)";
+							Serial1.println(errMsg);
+							log(errMsg);
+							digitalWrite( ALARM_LED_PIN, HIGH );
+					    }
+					    break;
+					}
+					else
+					{
+						*bufPtr++ = c;
+					}
+
+				} while ( cfgFile.available() );
+
+				// close the file:
+				cfgFile.close();
+			}
+			else
+			{
+				// if the file didn't open, print an error. Someone probably
+				// removed the SD card. It is an error situation. Raise an alarm
+				const char errMsg[] = "ERROR: error opening config.txt for reading";
+				Serial1.println(errMsg);
+				log(errMsg);
+				digitalWrite( ALARM_LED_PIN, HIGH );
+
+			}
+		}
+		else
+		{
+			const char errMsg[] = "ERROR: config.txt does not exist";
+			Serial1.println(errMsg);
+			log(errMsg);
 			digitalWrite( ALARM_LED_PIN, HIGH );
 
-			Serial1.println( "Failed to log. Is the SD inserted? Do not forget to reset after insertion" );
-			return false;
 		}
 
-		Serial1.print("after output: ");
-		Serial1.println(freeRam());
-		f.close();
-	} else {
-	// if the file didn't open, print an error:
-		digitalWrite( ALARM_LED_PIN, HIGH );
-
-		Serial1.print("error opening ");
-		Serial1.print( fileName );
-		Serial1.println(" for writing");
-		return false;
 	}
 
-	return true;
+#ifdef FREE_RAM_DEBUG
+	Serial1.print("at setup end: ");
+	Serial1.println(freeRam());
+#endif
 }
-
-
 
 void presentation()
 {
@@ -227,8 +343,8 @@ void loop()
 	Serial1.print(humidity);
 	Serial1.println("%");
 
-	sprintf(buf, "%d%02d%02d %02d:%02d:%02d DRYNESS = %d", now.year(), now.month(), now.day(), now.hour(),
-			now.minute(), now.second(), (int)humidity);
+	sprintf(buf, "%d%02d%02d %02d:%02d:%02d DRYNESS = %d, TEMP = %d", now.year(), now.month(), now.day(), now.hour(),
+			now.minute(), now.second(), (int)humidity, (int)temp_c);
 
 	log(buf);
 
@@ -238,8 +354,17 @@ void loop()
 
 	Serial1.println( buf );
 
+	if(temp_c < TEMP_LOWEST)
+	{
+		const char tempMsg[] = "Too low soil temperature. No watering will take place";
+		log(tempMsg);
+		Serial1.println(tempMsg);
+	}
 
-	if(consumedToday < dailyWaterLimit && humidity <= THRESHOLD_DRYNESS)
+	if(temp_c >= TEMP_LOWEST &&
+			consumedToday < dailyWaterLimit &&
+			isValidDrynessThreshold(dryness_threshold) &&
+			humidity <= dryness_threshold)
 	{
 
 		sprintf(buf, "%d%02d%02d %02d:%02d:%02d VALVE OPEN", now.year(), now.month(), now.day(), now.hour(),
@@ -257,17 +382,19 @@ void loop()
 
 		consumedToday += 3;
 
+		now = rtc.now();
+
 		sprintf(buf, "%d%02d%02d %02d:%02d:%02d VALVE SHUT. Water time consumed: %d sec", now.year(), now.month(), now.day(), now.hour(),
 				now.minute(), now.second(), consumedToday);
 
-		log(buf);
-
 		Serial1.println( buf );
+		log(buf);
 
 		if(consumedToday > dailyWaterLimit)
 		{
-			log("Daily limit consumed. Resting till tomorrow");
-			Serial1.print("Daily limit consumed. Resting till tomorrow");
+			const char msg[] = "Daily limit consumed. Resting till tomorrow";
+			Serial1.println(msg);
+			log(msg);
 		}
 	}
 	delay(3600000L);	// sleep for one hour
