@@ -2,6 +2,7 @@
 #include <RTClib.h>
 #include <SHT1x.h>
 
+#include "button.h"
 #include "GardenMaster.h"
 
 // Enable debug prints to serial monitor
@@ -23,7 +24,7 @@
 #define MY_RF24_CE_PIN 49
 #define MY_RF24_CS_PIN 53
 
-#define MY_TRANSPORT_WAIT_READY_MS 3000		// if the GW is down, carry on after 3 sec
+#define MY_TRANSPORT_WAIT_READY_MS 5000		// if the GW is down, carry on after 5 sec
 
 #include <MySensors.h>
 
@@ -41,7 +42,7 @@ const uint16_t SHT10_CLK = 7;				//
 // pin goes off and the event is logged down to SD log if possible
 
 static uint16_t dryness_threshold = 0;
-const uint16_t DRYNESS_LOWEST = 50;
+const uint16_t DRYNESS_LOWEST = 45;
 const uint16_t DRYNESS_HIGHEST = 95;
 const uint16_t TEMP_LOWEST = 10;
 
@@ -49,7 +50,9 @@ static SHT1x sht1x(SHT10_DATA, SHT10_CLK);
 
 
 const uint16_t MAGNET_VALVE_PIN = 8;		// valve control output
-const uint8_t ALARM_LED_PIN = 4;
+const uint8_t ALARM_LED_PIN = 69;
+const uint8_t ARM_LED_PIN = 67;
+const uint8_t VALVE_LED_PIN = 68;
 
 static RTC_DS1307 rtc;
 
@@ -68,7 +71,11 @@ static char configFileName[] = "config.txt";
 
 static int today = 0;
 
+Button button_bypass(66);
+Button button_arm(65);
 
+static bool __isArmed = true;
+static bool __isBypass = false;
 
 int freeRam () {
   extern int __heap_start, *__brkval;
@@ -122,7 +129,6 @@ void log(const char * buf)
 
 		const char errMsg[] = "ERROR: error opening file for writing";
 		Serial1.println(errMsg);
-		log(errMsg);
 	}
 }
 
@@ -150,8 +156,16 @@ void setup()
 	// ALRAM
 	pinMode(ALARM_LED_PIN, OUTPUT);
 	digitalWrite( ALARM_LED_PIN, LOW );
+	// BYPASS
+	pinMode(VALVE_LED_PIN, OUTPUT);
+	digitalWrite( VALVE_LED_PIN, LOW );
+	// ARM
+	pinMode(ARM_LED_PIN, OUTPUT);
+	digitalWrite( ARM_LED_PIN, HIGH );
 
 
+	button_bypass.begin();
+	button_arm.begin();
 
 	// The Real Time Clock
 
@@ -309,12 +323,57 @@ void presentation()
 	present(TEMP_CHILD_ID, S_TEMP);
 }
 
+// implement minute wrap-around counter to catch change in hour
+#define SECONDS_FROM_1970_TO_2000 946684800
 
+static uint8_t previous_minute = 60;
+static DateTime __skipUntil(SECONDS_FROM_1970_TO_2000);
+static DateTime __skipMeasurementUntil(SECONDS_FROM_1970_TO_2000);
+static DateTime __skipActivationUntil(SECONDS_FROM_1970_TO_2000);
+
+static bool __valveOpen = false;
+const uint32_t WATERING_DURATION = 180;
 
 // The loop function is called in an endless loop
 void loop()
 {
 	DateTime now = rtc.now();
+
+	if(button_bypass.getState() == Button::pressed)
+	{
+		button_bypass.resetState();
+
+		__isBypass = __valveOpen ? false : !__isBypass;
+		digitalWrite( VALVE_LED_PIN, __isBypass ? HIGH : LOW );
+
+		if(__isBypass && !__valveOpen)
+		{
+			Serial1.println("Bypass activated. The valve is open for 3 minutes");
+
+			__valveOpen = true;
+			digitalWrite(MAGNET_VALVE_PIN, HIGH);
+
+			// arm automatically if the bypass is pressed
+			__isArmed = true;
+			digitalWrite( ARM_LED_PIN, HIGH );
+
+			TimeSpan ts(WATERING_DURATION);
+			__skipUntil = now + ts;
+		}
+
+		if(!__isBypass && __valveOpen)
+		{
+			__skipUntil = now;
+		}
+	}
+
+	if(button_arm.getState() == Button::pressed)
+	{
+		button_arm.resetState();
+
+		__isArmed = !__isArmed;
+		digitalWrite( ARM_LED_PIN, __isArmed ? HIGH : LOW );
+	}
 
 	if(!today)
 	{
@@ -329,58 +388,93 @@ void loop()
 
 	char buf[128];
 
-	float temp_c = 0;
-	float humidity = 100;
 
-	// Read values from the sensor
-	temp_c = sht1x.readTemperatureC();
-	humidity = sht1x.readHumidity();
-
-	// Print the values to the serial port
-	Serial1.print("Temperature: ");
-	Serial1.print(temp_c, DEC);
-	Serial1.print("C. Humidity: ");
-	Serial1.print(humidity);
-	Serial1.println("%");
-
-	sprintf(buf, "%d%02d%02d %02d:%02d:%02d DRYNESS = %d, TEMP = %d", now.year(), now.month(), now.day(), now.hour(),
-			now.minute(), now.second(), (int)humidity, (int)temp_c);
-
-	log(buf);
-
-	send(msgMoist.set((int)humidity));
-	send(msgTemp.set((int)temp_c));
-
-
-	Serial1.println( buf );
-
-	if(temp_c < TEMP_LOWEST)
+	if(__skipMeasurementUntil.secondstime() == 0L ||
+			__skipMeasurementUntil.secondstime() < now.secondstime())
 	{
-		const char tempMsg[] = "Too low soil temperature. No watering will take place";
-		log(tempMsg);
-		Serial1.println(tempMsg);
-	}
+		float temp_c = 0;
+		float humidity = 100;
 
-	if(temp_c >= TEMP_LOWEST &&
-			consumedToday < dailyWaterLimit &&
-			isValidDrynessThreshold(dryness_threshold) &&
-			humidity <= dryness_threshold)
-	{
+		// Read values from the sensor
+		temp_c = sht1x.readTemperatureC();
+		humidity = sht1x.readHumidity();
 
-		sprintf(buf, "%d%02d%02d %02d:%02d:%02d VALVE OPEN", now.year(), now.month(), now.day(), now.hour(),
-				now.minute(), now.second());
+		// Print the values to the serial port
+		Serial1.print("Temperature: ");
+		Serial1.print(temp_c, DEC);
+		Serial1.print("C. Humidity: ");
+		Serial1.print(humidity);
+		Serial1.println("%");
 
-		log(buf);
+		sprintf(buf, "%d%02d%02d %02d:%02d:%02d DRYNESS = %d, TEMP = %d", now.year(), now.month(), now.day(), now.hour(),
+				now.minute(), now.second(), (int)humidity, (int)temp_c);
+
+		if(previous_minute > now.minute())		// minutes wrap. logging to SD once an hour
+			log(buf);
+
+		// the presentation before each send message is for
+		// re-establishing connection in case GW was down
+
+		presentation();
+
+		send(msgMoist.set((int)humidity));
+		send(msgTemp.set((int)temp_c));
+
 
 		Serial1.println( buf );
 
-		digitalWrite(MAGNET_VALVE_PIN, HIGH);
+		if(previous_minute > now.minute() && temp_c < TEMP_LOWEST)
+		{
+			const char tempMsg[] = "Too low soil temperature.";
 
-		delay(300000L);		// 3 minutes
+			log(tempMsg);
 
+			Serial1.println(tempMsg);
+		}
+
+		// activate watering if due
+
+		if(__isArmed &&
+				(__skipActivationUntil.secondstime() == 0L || __skipActivationUntil.secondstime() < now.secondstime()) &&
+				temp_c >= TEMP_LOWEST &&					// no watering when cold
+				consumedToday < dailyWaterLimit &&			// no watering too much
+				isValidDrynessThreshold(dryness_threshold) &&	// SD out or config.txt missing?
+				humidity <= dryness_threshold)					// .... only then, check the humidity
+		{
+			TimeSpan ts(3600);
+			TimeSpan tsOnTime(WATERING_DURATION);
+			__skipActivationUntil = now + ts;		// no watering coming hour
+			__skipUntil = now + tsOnTime;			// valve shut condition
+			__valveOpen = true;
+
+			sprintf(buf, "%d%02d%02d %02d:%02d:%02d VALVE OPEN", now.year(), now.month(), now.day(), now.hour(),
+					now.minute(), now.second());
+
+			log(buf);
+
+			Serial1.println( buf );
+
+			digitalWrite(MAGNET_VALVE_PIN, HIGH);
+			digitalWrite( VALVE_LED_PIN, HIGH );
+
+			consumedToday += 3;
+
+		}
+
+		TimeSpan ts(60);
+		__skipMeasurementUntil = now + ts;
+	}
+
+
+	// watering ongoing. Shut the valve when due
+
+	if(__skipUntil.secondstime() != 0L &&
+			__skipUntil.secondstime() < now.secondstime())
+	{
+		__skipUntil = DateTime(SECONDS_FROM_1970_TO_2000);
 		digitalWrite(MAGNET_VALVE_PIN, LOW);
-
-		consumedToday += 3;
+		digitalWrite( VALVE_LED_PIN, LOW );
+		__valveOpen = false;
 
 		now = rtc.now();
 
@@ -396,8 +490,10 @@ void loop()
 			Serial1.println(msg);
 			log(msg);
 		}
+
 	}
-	delay(3600000L);	// sleep for one hour
+
+	previous_minute = now.minute();
 
 }
 
